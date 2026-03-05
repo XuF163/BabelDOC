@@ -341,13 +341,39 @@ class OnnxModel(DocLayoutModel):
             target_imgsz = 1024
 
             # Preprocess batch
-            processed_batch = []
+            padded_images = []
             orig_shapes = []
+            max_h = 0
+            max_w = 0
             for img in batch_images:
                 orig_h, orig_w = img.shape[:2]
                 orig_shapes.append((orig_h, orig_w))
 
                 pix = self.resize_and_pad_image(img, new_shape=target_imgsz)
+                h, w = pix.shape[:2]
+                max_h = max(max_h, h)
+                max_w = max(max_w, w)
+                padded_images.append(pix)
+
+            processed_batch = []
+            for pix in padded_images:
+                h, w = pix.shape[:2]
+                if h != max_h or w != max_w:
+                    dh = max_h - h
+                    dw = max_w - w
+                    top = dh // 2
+                    bottom = dh - top
+                    left = dw // 2
+                    right = dw - left
+                    pix = cv2.copyMakeBorder(
+                        pix,
+                        top,
+                        bottom,
+                        left,
+                        right,
+                        cv2.BORDER_CONSTANT,
+                        value=(114, 114, 114),
+                    )
                 pix = np.transpose(pix, (2, 0, 1))  # CHW
                 pix = pix.astype(np.float32) / 255.0  # Normalize to [0, 1]
                 processed_batch.append(pix)
