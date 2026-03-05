@@ -187,19 +187,38 @@ class OnnxModel(DocLayoutModel):
         total_images = len(image)
         results = []
 
-        # Allow tuning batch size via env var to balance speed/memory.
-        # Default is intentionally conservative to avoid large allocations:
-        # (B, 3, 1024, 1024) float32 ~= 12MB per image.
+        # Batch size selection (env override > caller hint > dynamic default).
+        #
+        # Dynamic default:
+        # - pages > 64  => batch 16
+        # - pages > 32  => batch 8
+        # - otherwise   => batch 4
+        #
+        # Memory note: (B, 3, 1024, 1024) float32 ~= 12MB per image.
+        resolved_batch_size = 0
         env_bs = os.getenv("BABELDOC_DOCLAYOUT_BATCH_SIZE", "").strip()
         if env_bs:
             try:
-                batch_size = int(env_bs)
+                resolved_batch_size = int(env_bs)
             except ValueError:
-                batch_size = 0
-        batch_size = int(batch_size) if batch_size is not None else 0
-        if batch_size <= 0:
-            batch_size = 4
-        batch_size = min(batch_size, total_images) if total_images else batch_size
+                resolved_batch_size = 0
+        else:
+            try:
+                resolved_batch_size = int(batch_size) if batch_size is not None else 0
+            except (TypeError, ValueError):
+                resolved_batch_size = 0
+
+        if resolved_batch_size <= 0:
+            if total_images > 64:
+                resolved_batch_size = 16
+            elif total_images > 32:
+                resolved_batch_size = 8
+            else:
+                resolved_batch_size = 4
+        if total_images:
+            resolved_batch_size = min(resolved_batch_size, total_images)
+
+        batch_size = resolved_batch_size
 
         # Process images in batches
         for i in range(0, total_images, batch_size):
@@ -253,6 +272,7 @@ class OnnxModel(DocLayoutModel):
     ]:
         # Keep memory bounded by batching page images, while still reducing
         # per-page ONNX invocation overhead.
+        total_pages = len(pages)
         env_bs = os.getenv("BABELDOC_DOCLAYOUT_BATCH_SIZE", "").strip()
         handle_batch_size = 0
         if env_bs:
@@ -261,7 +281,14 @@ class OnnxModel(DocLayoutModel):
             except ValueError:
                 handle_batch_size = 0
         if handle_batch_size <= 0:
-            handle_batch_size = 4
+            if total_pages > 64:
+                handle_batch_size = 16
+            elif total_pages > 32:
+                handle_batch_size = 8
+            else:
+                handle_batch_size = 4
+        if total_pages:
+            handle_batch_size = min(handle_batch_size, total_pages)
 
         batch_pages: list[babeldoc.format.pdf.document_il.il_version_1.Page] = []
         batch_images: list[np.ndarray] = []
