@@ -33,6 +33,149 @@ from babeldoc.assets.assets import get_doclayout_onnx_model_path
 logger = logging.getLogger(__name__)
 
 
+def _parse_int_env(name: str) -> int:
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return 0
+    try:
+        return int(raw)
+    except ValueError:
+        return 0
+
+
+def _parse_float_env(name: str, default: float) -> float:
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        return default
+
+
+def _read_int_file(path: str) -> int | None:
+    try:
+        with open(path, encoding="utf-8") as f:
+            raw = f.read().strip()
+    except OSError:
+        return None
+    if not raw or raw == "max":
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        return None
+
+
+def _get_available_memory_bytes() -> int | None:
+    """
+    Best-effort available memory detection (container-aware).
+
+    Priority:
+    1) cgroup v2 (memory.max - memory.current)
+    2) cgroup v1 (memory.limit_in_bytes - memory.usage_in_bytes)
+    3) /proc/meminfo MemAvailable
+    """
+    try:
+        limit = _read_int_file("/sys/fs/cgroup/memory.max")
+        current = _read_int_file("/sys/fs/cgroup/memory.current")
+        if limit is not None and current is not None:
+            if 0 < limit < (1 << 60) and current >= 0:
+                avail = limit - current
+                if avail > 0:
+                    return avail
+    except Exception:
+        pass
+
+    try:
+        limit = _read_int_file("/sys/fs/cgroup/memory/memory.limit_in_bytes")
+        current = _read_int_file("/sys/fs/cgroup/memory/memory.usage_in_bytes")
+        if limit is not None and current is not None:
+            if 0 < limit < (1 << 60) and current >= 0:
+                avail = limit - current
+                if avail > 0:
+                    return avail
+    except Exception:
+        pass
+
+    try:
+        with open("/proc/meminfo", encoding="utf-8") as f:
+            for line in f:
+                if not line.startswith("MemAvailable:"):
+                    continue
+                parts = line.split()
+                if len(parts) < 2:
+                    break
+                return int(parts[1]) * 1024
+    except Exception:
+        pass
+
+    return None
+
+
+def _resolve_doclayout_batch_size(total_images: int, requested_batch_size: int | None = None) -> int:
+    """
+    Resolve DocLayout batch size.
+
+    Priority:
+    1) BABELDOC_DOCLAYOUT_BATCH_SIZE (absolute override)
+    2) requested_batch_size (caller hint)
+    3) dynamic default (more aggressive for throughput)
+
+    Additional caps:
+    - BABELDOC_DOCLAYOUT_MAX_BATCH_SIZE / BABELDOC_DOCLAYOUT_MAX_BATCH (default 64)
+    - available memory cap (best-effort):
+        budget = MemAvailable * BABELDOC_DOCLAYOUT_AUTO_BATCH_MEM_FRACTION (default 0.25)
+        per_image_mb = BABELDOC_DOCLAYOUT_PER_IMAGE_MB (default 24)
+    """
+    if total_images <= 0:
+        return 0
+
+    env_bs = _parse_int_env("BABELDOC_DOCLAYOUT_BATCH_SIZE")
+    if env_bs > 0:
+        return min(env_bs, total_images)
+
+    resolved = 0
+    if requested_batch_size is not None:
+        try:
+            resolved = int(requested_batch_size)
+        except (TypeError, ValueError):
+            resolved = 0
+
+    if resolved <= 0:
+        if total_images > 64:
+            resolved = 64
+        elif total_images > 32:
+            resolved = 32
+        elif total_images > 8:
+            resolved = 16
+        else:
+            resolved = 4
+
+    max_bs = (
+        _parse_int_env("BABELDOC_DOCLAYOUT_MAX_BATCH_SIZE")
+        or _parse_int_env("BABELDOC_DOCLAYOUT_MAX_BATCH")
+    )
+    if max_bs <= 0:
+        max_bs = 64
+
+    mem_fraction = _parse_float_env("BABELDOC_DOCLAYOUT_AUTO_BATCH_MEM_FRACTION", 0.25)
+    mem_fraction = max(0.0, min(mem_fraction, 1.0))
+    per_image_mb = _parse_int_env("BABELDOC_DOCLAYOUT_PER_IMAGE_MB")
+    if per_image_mb <= 0:
+        per_image_mb = 24
+
+    mem_avail = _get_available_memory_bytes()
+    if mem_avail is not None and mem_fraction > 0 and per_image_mb > 0:
+        budget_mb = int(mem_avail * mem_fraction / (1024 * 1024))
+        if budget_mb > 0:
+            mem_cap = max(1, budget_mb // per_image_mb)
+            resolved = min(resolved, mem_cap)
+
+    resolved = min(resolved, max_bs, total_images)
+    return max(1, resolved)
+
+
 # 检测操作系统类型
 os_name = platform.system()
 
@@ -187,38 +330,7 @@ class OnnxModel(DocLayoutModel):
         total_images = len(image)
         results = []
 
-        # Batch size selection (env override > caller hint > dynamic default).
-        #
-        # Dynamic default:
-        # - pages > 64  => batch 16
-        # - pages > 32  => batch 8
-        # - otherwise   => batch 4
-        #
-        # Memory note: (B, 3, 1024, 1024) float32 ~= 12MB per image.
-        resolved_batch_size = 0
-        env_bs = os.getenv("BABELDOC_DOCLAYOUT_BATCH_SIZE", "").strip()
-        if env_bs:
-            try:
-                resolved_batch_size = int(env_bs)
-            except ValueError:
-                resolved_batch_size = 0
-        else:
-            try:
-                resolved_batch_size = int(batch_size) if batch_size is not None else 0
-            except (TypeError, ValueError):
-                resolved_batch_size = 0
-
-        if resolved_batch_size <= 0:
-            if total_images > 64:
-                resolved_batch_size = 16
-            elif total_images > 32:
-                resolved_batch_size = 8
-            else:
-                resolved_batch_size = 4
-        if total_images:
-            resolved_batch_size = min(resolved_batch_size, total_images)
-
-        batch_size = resolved_batch_size
+        batch_size = _resolve_doclayout_batch_size(total_images, batch_size)
 
         # Process images in batches
         for i in range(0, total_images, batch_size):
@@ -273,22 +385,12 @@ class OnnxModel(DocLayoutModel):
         # Keep memory bounded by batching page images, while still reducing
         # per-page ONNX invocation overhead.
         total_pages = len(pages)
-        env_bs = os.getenv("BABELDOC_DOCLAYOUT_BATCH_SIZE", "").strip()
-        handle_batch_size = 0
-        if env_bs:
-            try:
-                handle_batch_size = int(env_bs)
-            except ValueError:
-                handle_batch_size = 0
-        if handle_batch_size <= 0:
-            if total_pages > 64:
-                handle_batch_size = 16
-            elif total_pages > 32:
-                handle_batch_size = 8
-            else:
-                handle_batch_size = 4
-        if total_pages:
-            handle_batch_size = min(handle_batch_size, total_pages)
+        handle_batch_size = _resolve_doclayout_batch_size(total_pages, None)
+        logger.info(
+            "DocLayout batch size resolved to %s (pages=%s)",
+            handle_batch_size,
+            total_pages,
+        )
 
         batch_pages: list[babeldoc.format.pdf.document_il.il_version_1.Page] = []
         batch_images: list[np.ndarray] = []
