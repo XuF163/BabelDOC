@@ -1,5 +1,6 @@
 import ast
 import logging
+import os
 import platform
 import re
 import threading
@@ -44,15 +45,39 @@ class OnnxModel(DocLayoutModel):
         metadata = {d.key: d.value for d in model.metadata_props}
         self._stride = ast.literal_eval(metadata["stride"])
         self._names = ast.literal_eval(metadata["names"])
-        providers = []
+        providers: list[str] = []
 
         available_providers = onnxruntime.get_available_providers()
-        for provider in available_providers:
-            # disable dml|cuda|
-            # directml/cuda may encounter problems under special circumstances
-            if re.match(r"cpu", provider, re.IGNORECASE):
-                logger.info(f"Available Provider: {provider}")
-                providers.append(provider)
+
+        # Default to CPU-only for stability. Users can explicitly opt-in to other
+        # providers (CUDA/DirectML/etc) for speed via env vars.
+        env_providers = os.getenv("BABELDOC_DOCLAYOUT_PROVIDERS", "").strip()
+        allow_non_cpu = os.getenv("BABELDOC_DOCLAYOUT_ALLOW_NON_CPU", "").strip().lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        )
+        if env_providers:
+            wanted = [p.strip() for p in env_providers.split(",") if p.strip()]
+            providers = [p for p in wanted if p in available_providers]
+            if not providers:
+                logger.warning(
+                    "BABELDOC_DOCLAYOUT_PROVIDERS is set but none matched available providers: %s",
+                    available_providers,
+                )
+        if not providers:
+            if allow_non_cpu:
+                providers = list(available_providers)
+            else:
+                for provider in available_providers:
+                    if re.match(r"cpu", provider, re.IGNORECASE):
+                        providers.append(provider)
+        if not providers:
+            # Last-resort: let onnxruntime decide.
+            providers = list(available_providers)
+        if providers:
+            logger.info("DocLayout ONNX providers: %s", providers)
         self.model = onnxruntime.InferenceSession(
             model.SerializeToString(),
             providers=providers,
@@ -161,7 +186,20 @@ class OnnxModel(DocLayoutModel):
 
         total_images = len(image)
         results = []
-        batch_size = 1
+
+        # Allow tuning batch size via env var to balance speed/memory.
+        # Default is intentionally conservative to avoid large allocations:
+        # (B, 3, 1024, 1024) float32 ~= 12MB per image.
+        env_bs = os.getenv("BABELDOC_DOCLAYOUT_BATCH_SIZE", "").strip()
+        if env_bs:
+            try:
+                batch_size = int(env_bs)
+            except ValueError:
+                batch_size = 0
+        batch_size = int(batch_size) if batch_size is not None else 0
+        if batch_size <= 0:
+            batch_size = 4
+        batch_size = min(batch_size, total_images) if total_images else batch_size
 
         # Process images in batches
         for i in range(0, total_images, batch_size):
@@ -169,7 +207,6 @@ class OnnxModel(DocLayoutModel):
             batch_size_actual = len(batch_images)
 
             # Calculate target size based on the maximum height in the batch
-            max_height = max(img.shape[0] for img in batch_images)
             target_imgsz = 1024
 
             # Preprocess batch
@@ -214,20 +251,45 @@ class OnnxModel(DocLayoutModel):
     ) -> Generator[
         tuple[babeldoc.format.pdf.document_il.il_version_1.Page, YoloResult], None, None
     ]:
+        # Keep memory bounded by batching page images, while still reducing
+        # per-page ONNX invocation overhead.
+        env_bs = os.getenv("BABELDOC_DOCLAYOUT_BATCH_SIZE", "").strip()
+        handle_batch_size = 0
+        if env_bs:
+            try:
+                handle_batch_size = int(env_bs)
+            except ValueError:
+                handle_batch_size = 0
+        if handle_batch_size <= 0:
+            handle_batch_size = 4
+
+        batch_pages: list[babeldoc.format.pdf.document_il.il_version_1.Page] = []
+        batch_images: list[np.ndarray] = []
+
+        def flush_batch():
+            if not batch_pages:
+                return
+            preds = self.predict(batch_images, batch_size=handle_batch_size)
+            for page, image, pred in zip(batch_pages, batch_images, preds, strict=True):
+                save_debug_image(image, pred, page.page_number + 1)
+                yield page, pred
+
         for page in pages:
             translate_config.raise_if_cancelled()
             with self.lock:
-                # pix = mupdf_doc[page.page_number].get_pixmap(dpi=72)
                 pix = get_no_rotation_img(mupdf_doc[page.page_number])
             image = np.frombuffer(pix.samples, np.uint8).reshape(
                 pix.height,
                 pix.width,
                 3,
             )[:, :, ::-1]
-            predict_result = self.predict(image)[0]
-            save_debug_image(
-                image,
-                predict_result,
-                page.page_number + 1,
-            )
-            yield page, predict_result
+
+            batch_pages.append(page)
+            batch_images.append(image)
+            if len(batch_pages) >= handle_batch_size:
+                yield from flush_batch()
+                batch_pages.clear()
+                batch_images.clear()
+
+        if batch_pages:
+            yield from flush_batch()
